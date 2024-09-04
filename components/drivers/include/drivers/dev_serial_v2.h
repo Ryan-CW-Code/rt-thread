@@ -250,7 +250,7 @@ struct serial_configure
  * @brief Serial Receive FIFO mode
  */
 struct rt_serial_rx_fifo
-{    
+{
     struct rt_ringbuffer rb;
 
     struct rt_completion rx_cpt;
