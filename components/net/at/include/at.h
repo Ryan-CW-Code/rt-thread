@@ -91,7 +91,7 @@ struct at_server
     char recv_buffer[AT_SERVER_RECV_BUFF_LEN];
     rt_size_t cur_recv_len;
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
     rt_sem_t rx_notice;
 #endif
 
@@ -169,7 +169,7 @@ struct at_client
     /* The maximum supported receive data length */
     rt_size_t recv_bufsz;
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
     rt_sem_t rx_notice;
 #endif
 

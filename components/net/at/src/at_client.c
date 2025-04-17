@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006-2024 RT-Thread Development Team
+ * Copyright (c) 2006-2025 RT-Thread Development Team
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -11,6 +11,7 @@
  * 2021-03-17     Meco Man     fix a buf of leaking memory
  * 2021-07-14     Sszl         fix a buf of leaking memory
  * 2025-01-02     dongly       support SERIAL_V2
+ * 2025-04-18     RyanCw       support New SERIAL_V2
  */
 
 #include <at.h>
@@ -225,7 +226,8 @@ int at_resp_parse_line_args(at_response_t resp, rt_size_t resp_line, const char 
     RT_ASSERT(resp);
     RT_ASSERT(resp_expr);
 
-    if ((resp_line_buf = at_resp_get_line(resp, resp_line)) == RT_NULL)
+    resp_line_buf = at_resp_get_line(resp, resp_line);
+    if (resp_line_buf == RT_NULL)
     {
         return -1;
     }
@@ -259,7 +261,8 @@ int at_resp_parse_line_args_by_kw(at_response_t resp, const char *keyword, const
     RT_ASSERT(resp);
     RT_ASSERT(resp_expr);
 
-    if ((resp_line_buf = at_resp_get_line_by_kw(resp, keyword)) == RT_NULL)
+    resp_line_buf = at_resp_get_line_by_kw(resp, keyword);
+    if (resp_line_buf == RT_NULL)
     {
         return -1;
     }
@@ -541,7 +544,7 @@ static rt_err_t at_client_getchar(at_client_t client, char *ch, rt_int32_t timeo
 {
     rt_err_t result = RT_EOK;
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
     while (rt_device_read(client->device, 0, ch, 1) == 0)
     {
         result = rt_sem_take(client->rx_notice, rt_tick_from_millisecond(timeout));
@@ -592,7 +595,7 @@ rt_size_t at_client_obj_recv(at_client_t client, char *buf, rt_size_t size, rt_i
         return 0;
     }
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
     while (size)
     {
         rt_size_t read_len;
@@ -800,7 +803,8 @@ static int at_recv_readline(at_client_t client)
         }
 
         /* is newline or URC data */
-        if ((client->urc = get_urc_obj(client)) != RT_NULL || (ch == '\n' && last_ch == '\r')
+        client->urc = get_urc_obj(client);
+        if (client->urc != RT_NULL || (ch == '\n' && last_ch == '\r')
                 || (client->end_sign != 0 && ch == client->end_sign))
         {
             if (is_full)
@@ -897,7 +901,7 @@ static void client_parser(at_client_t client)
     }
 }
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
 static rt_err_t at_client_rx_ind(rt_device_t dev, rt_size_t size)
 {
     int idx = 0;
@@ -955,7 +959,7 @@ static int at_client_para_init(at_client_t client)
         goto __exit;
     }
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
     rt_snprintf(name, RT_NAME_MAX, "%s%d", AT_CLIENT_SEM_NAME, at_client_num);
     client->rx_notice = rt_sem_create(name, 0, RT_IPC_FLAG_FIFO);
     if (client->rx_notice == RT_NULL)
@@ -983,7 +987,8 @@ static int at_client_para_init(at_client_t client)
                                      (void (*)(void *parameter))client_parser,
                                      client,
                                      1024 + 512,
-                                     RT_THREAD_PRIORITY_MAX / 3 - 1,
+                                     6,
+                                    /*  RT_THREAD_PRIORITY_MAX / 3 - 1,*/
                                      5);
     if (client->parser == RT_NULL)
     {
@@ -998,7 +1003,7 @@ __exit:
             rt_mutex_delete(client->lock);
         }
 
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
         if (client->rx_notice)
         {
             rt_sem_delete(client->rx_notice);
@@ -1081,7 +1086,7 @@ int at_client_init(const char *dev_name, rt_size_t recv_bufsz, rt_size_t send_bu
     if (client->device)
     {
         RT_ASSERT(client->device->type == RT_Device_Class_Char);
-#if (!defined(RT_USING_SERIAL_V2) || RT_VER_NUM < 0x50200)
+#if (!defined(RT_USING_SERIAL_V2))
         rt_device_set_rx_indicate(client->device, at_client_rx_ind);
 
 #ifdef RT_USING_SERIAL_V2
