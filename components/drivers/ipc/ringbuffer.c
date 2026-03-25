@@ -10,7 +10,7 @@
  * 2016-08-18     heyuanjie    add interface
  * 2021-07-20     arminker     fix write_index bug in function rt_ringbuffer_put_force
  * 2021-08-14     Jackistang   add comments for function interface.
- * 2026-03-16     RyanCW(Codex) fix put_force overwrite in wrapped state
+ * 2026-03-16     RyanCW       fix put_force overwrite in wrapped state
  */
 
 #include <rtdevice.h>
