@@ -111,6 +111,17 @@ struct wq_cancel_all_ctx
     volatile rt_err_t submit_ret2;
 };
 
+struct wq_cancel_all_race_ctx
+{
+    struct rt_workqueue *queue;
+    struct rt_work *work;
+    struct rt_semaphore done;
+    volatile rt_bool_t stop;
+    volatile rt_uint32_t submit_ok;
+};
+
+#define WQ_CANCEL_ALL_RACE_LOOPS 200
+
 struct wq_self_cancel_ctx
 {
     struct rt_workqueue *queue;
@@ -241,6 +252,24 @@ static void wq_cancel_all_requeue_fun(struct rt_work *work, void *work_data)
     rt_sem_take(&ctx->allow_finish, RT_WAITING_FOREVER);
     /* Requeue after cancel_all while cancel_sync is waiting. */
     ctx->submit_ret2 = rt_workqueue_submit_work(ctx->queue, work, 0);
+    rt_sem_release(&ctx->done);
+}
+
+static void wq_cancel_all_race_entry(void *parameter)
+{
+    struct wq_cancel_all_race_ctx *ctx = (struct wq_cancel_all_race_ctx *)parameter;
+    rt_err_t err;
+
+    while (!ctx->stop)
+    {
+        err = rt_workqueue_submit_work(ctx->queue, ctx->work, 0);
+        if (err == RT_EOK)
+        {
+            ctx->submit_ok += 1;
+        }
+        rt_thread_yield();
+    }
+
     rt_sem_release(&ctx->done);
 }
 
@@ -1084,6 +1113,73 @@ static void test_workqueue_stress_submit_cancel(void)
     rt_sem_detach(&ctx1.done);
 }
 
+static void test_workqueue_cancel_all_submit_race(void)
+{
+    struct rt_workqueue *queue;
+    struct rt_work work;
+    struct wq_cancel_all_race_ctx ctx;
+    rt_thread_t thread;
+    rt_uint8_t curr_priority;
+    rt_err_t err;
+    volatile int count = 0;
+    int count_before;
+    int i;
+
+    curr_priority = wq_get_test_thread_priority(-1);
+    queue = rt_workqueue_create("test", 2048, curr_priority);
+    uassert_not_null(queue);
+    if (queue == RT_NULL)
+    {
+        return;
+    }
+
+    rt_work_init(&work, wq_inc_work_fun, (void *)&count);
+    err = rt_sem_init(&ctx.done, "wqcad", 0, RT_IPC_FLAG_FIFO);
+    uassert_int_equal(err, RT_EOK);
+    ctx.queue = queue;
+    ctx.work = &work;
+    ctx.stop = RT_FALSE;
+    ctx.submit_ok = 0;
+
+    thread = rt_thread_create("wqcas", wq_cancel_all_race_entry, &ctx,
+                              1024, wq_get_test_thread_priority(1), 10);
+    uassert_not_null(thread);
+    if (thread == RT_NULL)
+    {
+        rt_sem_detach(&ctx.done);
+        rt_workqueue_destroy(queue);
+        return;
+    }
+    rt_thread_startup(thread);
+
+    /* Race submit of the same work against cancel_all. The work must either
+     * stay queued or be unbound/canceled, never sit on a detached list while
+     * another CPU requeues it. */
+    for (i = 0; i < WQ_CANCEL_ALL_RACE_LOOPS; i++)
+    {
+        err = rt_workqueue_cancel_all_work(queue);
+        uassert_int_equal(err, RT_EOK);
+        rt_thread_delay(1);
+    }
+
+    ctx.stop = RT_TRUE;
+    err = rt_sem_take(&ctx.done, rt_tick_from_millisecond(1000));
+    uassert_int_equal(err, RT_EOK);
+    uassert_true(ctx.submit_ok > 0);
+
+    /* The queue must remain usable after the race. */
+    err = rt_workqueue_cancel_all_work(queue);
+    uassert_int_equal(err, RT_EOK);
+    count_before = count;
+    err = rt_workqueue_submit_work(queue, &work, 0);
+    uassert_int_equal(err, RT_EOK);
+    rt_thread_delay(rt_tick_from_millisecond(10));
+    uassert_true(count > count_before);
+
+    rt_sem_detach(&ctx.done);
+    rt_workqueue_destroy_sync(queue);
+}
+
 static void test_workqueue_cross_queue_running_reject(void)
 {
     struct rt_workqueue *queue1;
@@ -1486,6 +1582,8 @@ void workqueue_cancel_testcase(void)
     UTEST_UNIT_RUN(test_workqueue_cancel_all_keep_canceling);
     /* Stress submit/cancel with fixed seed */
     UTEST_UNIT_RUN(test_workqueue_stress_submit_cancel);
+    /* cancel_all must not race with resubmit of the same work. */
+    UTEST_UNIT_RUN(test_workqueue_cancel_all_submit_race);
     /* Reject cross-queue operations (running + pending/delayed) */
     UTEST_UNIT_RUN(test_workqueue_cross_queue_running_reject);
     /* Cancel pending and delayed work. */

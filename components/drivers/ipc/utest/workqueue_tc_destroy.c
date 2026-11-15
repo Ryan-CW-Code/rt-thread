@@ -102,6 +102,7 @@ struct wq_destroy_status_ctx
 
 #define WQ_DESTROY_STRESS_THREADS 4
 #define WQ_DESTROY_STRESS_LOOPS   100
+#define WQ_DESTROY_ASYNC_DELAYED_LOOPS 100
 
 struct wq_destroy_stress_ctx
 {
@@ -196,6 +197,16 @@ static void wq_destroy_status_work_fun(struct rt_work *work, void *work_data)
     ctx->submit_ret = rt_workqueue_submit_work(ctx->queue, work, 0);
     rt_sem_release(&ctx->started);
     rt_sem_take(&ctx->allow_finish, RT_WAITING_FOREVER);
+}
+
+static volatile rt_int32_t wq_destroy_async_delayed_runs;
+static struct rt_work wq_destroy_async_delayed_works[WQ_DESTROY_ASYNC_DELAYED_LOOPS];
+
+static void wq_destroy_async_delayed_fun(struct rt_work *work, void *work_data)
+{
+    (void)work;
+    (void)work_data;
+    wq_destroy_async_delayed_runs += 1;
 }
 
 static void wq_destroy_stress_run_fun(struct rt_work *work, void *work_data)
@@ -562,6 +573,46 @@ static void test_workqueue_destroy_async_while_running(void)
     rt_sem_detach(&destroy_ctx.started);
     rt_sem_detach(&run_ctx.allow_finish);
     rt_sem_detach(&run_ctx.started);
+}
+
+static void test_workqueue_destroy_async_delayed_race(void)
+{
+    struct rt_workqueue *queue;
+    rt_uint8_t curr_priority;
+    rt_err_t err;
+    int i;
+
+    curr_priority = wq_get_test_thread_priority(-1);
+    wq_destroy_async_delayed_runs = 0;
+
+    for (i = 0; i < WQ_DESTROY_ASYNC_DELAYED_LOOPS; i++)
+    {
+        queue = rt_workqueue_create("test", 2048, curr_priority);
+        uassert_not_null(queue);
+        if (queue == RT_NULL)
+        {
+            return;
+        }
+
+        /* One work per iteration: an async destroy may return while the
+         * worker still owns the previous work item. */
+        rt_work_init(&wq_destroy_async_delayed_works[i], wq_destroy_async_delayed_fun, RT_NULL);
+        /* Delayed-only queue: destroy sees an idle run queue. */
+        err = rt_workqueue_submit_work(queue, &wq_destroy_async_delayed_works[i], 1);
+        uassert_int_equal(err, RT_EOK);
+
+        /* Wake up together with the delayed timeout so the worker exit check
+         * can interleave with the destroy path on SMP. */
+        rt_thread_delay(1);
+        err = rt_workqueue_destroy(queue);
+        uassert_int_equal(err, RT_EOK);
+
+        /* Let the worker observe DESTROYING and free the queue. */
+        rt_thread_delay(rt_tick_from_millisecond(5));
+    }
+
+    /* The delayed work may have run before destroy; only sanity-check. */
+    uassert_true(wq_destroy_async_delayed_runs <= WQ_DESTROY_ASYNC_DELAYED_LOOPS);
 }
 
 static void test_workqueue_destroy_busy_when_sync_waiting(void)
@@ -983,6 +1034,8 @@ void workqueue_destroy_testcase(void)
     UTEST_UNIT_RUN(test_workqueue_destroy_in_callback_busy);
     /* Destroy should return before a blocked running work is released. */
     UTEST_UNIT_RUN(test_workqueue_destroy_async_while_running);
+    /* Async destroy vs delayed timeout should not touch a freed queue. */
+    UTEST_UNIT_RUN(test_workqueue_destroy_async_delayed_race);
     /* Destroy returns busy when a sync waiter exists. */
     UTEST_UNIT_RUN(test_workqueue_destroy_busy_when_sync_waiting);
     /* Destroy returns busy when destroying flag is already set. */
