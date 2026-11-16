@@ -66,8 +66,13 @@ static void _workqueue_detach_queued_nolock(struct rt_workqueue *queue,
     _workqueue_move_list_nolock(delayed_list, &queue->delayed_list);
 }
 
-/* The caller must exclude the currently running work from the detached list. */
-static void _workqueue_cancel_detached_list(rt_list_t *list)
+/*
+ * Cancel a detached list. The caller must hold queue->spinlock and must
+ * exclude the currently running work from the list. Unbinding each work and
+ * moving it to CANCELED happens before the lock is dropped, so a concurrent
+ * submit either observes the work still queued or already canceled.
+ */
+static void _workqueue_cancel_detached_list_nolock(rt_list_t *list)
 {
     struct rt_work *work;
 
@@ -120,19 +125,20 @@ static rt_err_t _workqueue_prepare_destroy(struct rt_workqueue *queue,
         }
     }
 
-    /* Reject new work immediately, then detach everything not currently running. */
+    /* Reject new work immediately, then detach and unbind everything not
+     * currently running in the same critical section. */
     queue->flags |= RT_WORKQUEUE_FLAG_DESTROYING;
     _workqueue_detach_queued_nolock(queue, pending_list, delayed_list);
-    rt_spin_unlock_irqrestore(&(queue->spinlock), level);
-
-    /* Finish detached-list cancel outside the spinlock. */
-    _workqueue_cancel_detached_list(pending_list);
-    _workqueue_cancel_detached_list(delayed_list);
+    _workqueue_cancel_detached_list_nolock(pending_list);
+    _workqueue_cancel_detached_list_nolock(delayed_list);
     if (queue_was_idle)
     {
-        /* Wake a sleeping worker so it can observe destroying and exit. */
+        /* Wake a sleeping worker so it can observe destroying and exit.
+         * Keep the notification under the queue lock: the worker cannot
+         * free the queue before this access to wakeup_completion finishes. */
         rt_completion_done(&(queue->wakeup_completion));
     }
+    rt_spin_unlock_irqrestore(&(queue->spinlock), level);
 
     return RT_EOK;
 }
@@ -160,8 +166,8 @@ static rt_err_t _workqueue_destroy(struct rt_workqueue *queue, rt_bool_t sync)
         return RT_EOK;
     }
 
-    /* Wait until the worker drains the queue and hands ownership back. */
-    rt_completion_wait(&(queue->sync_completion), RT_WAITING_FOREVER);
+    /* Wait until the worker drains the queue and signals its exit. */
+    rt_completion_wait(&(queue->exit_completion), RT_WAITING_FOREVER);
     RT_KERNEL_FREE(queue);
 
     return RT_EOK;
@@ -350,7 +356,7 @@ static void _workqueue_thread_entry(void *parameter)
 
             if (notify_sync_waiter)
             {
-                rt_completion_done(&(queue->sync_completion));
+                rt_completion_done(&(queue->exit_completion));
             }
             else
             {
@@ -494,23 +500,25 @@ static rt_err_t _workqueue_submit_work(struct rt_workqueue *queue,
         work->timeout_tick = timeout_tick;
         _workqueue_insert_delayed_nolock(queue, work);
     }
-    rt_spin_unlock_irqrestore(&(queue->spinlock), level);
     if (need_wakeup)
     {
+        /* Signal before dropping the lock so a concurrent destroy cannot let
+         * the worker free the queue between the unlock and this notification. */
         rt_completion_done(&(queue->wakeup_completion));
     }
+    rt_spin_unlock_irqrestore(&(queue->spinlock), level);
     return RT_EOK;
 }
 
 static rt_err_t _workqueue_cancel_core(struct rt_workqueue *queue,
                                        struct rt_work *work,
                                        rt_bool_t sync,
-                                       rt_bool_t *need_wakeup,
                                        rt_bool_t *need_wait)
 {
     rt_base_t level;
     rt_err_t err = RT_EOK;
     rt_bool_t sched_available = RT_FALSE;
+    rt_bool_t need_wakeup = RT_FALSE;
 
     if (sync)
     {
@@ -558,10 +566,15 @@ static rt_err_t _workqueue_cancel_core(struct rt_workqueue *queue,
 
     if (work->list.next != &(work->list))
     {
-        *need_wakeup = _workqueue_cancel_queued_work_nolock(queue, work);
+        need_wakeup = _workqueue_cancel_queued_work_nolock(queue, work);
     }
 
 __exit:
+    if (need_wakeup)
+    {
+        /* Keep the notification under the queue lock; see submit/destroy. */
+        rt_completion_done(&(queue->wakeup_completion));
+    }
     rt_spin_unlock_irqrestore(&(queue->spinlock), level);
 
     return err;
@@ -613,6 +626,7 @@ struct rt_workqueue *rt_workqueue_create(const char *name, rt_uint16_t stack_siz
     queue->flags = 0;
     rt_completion_init(&(queue->wakeup_completion));
     rt_completion_init(&(queue->sync_completion));
+    rt_completion_init(&(queue->exit_completion));
 
     queue->work_thread = rt_thread_create(name, _workqueue_thread_entry, queue, stack_size, priority, 10);
     if (queue->work_thread == RT_NULL)
@@ -728,15 +742,10 @@ rt_err_t rt_workqueue_urgent_work(struct rt_workqueue *queue, struct rt_work *wo
 rt_err_t rt_workqueue_cancel_work(struct rt_workqueue *queue, struct rt_work *work)
 {
     rt_err_t err;
-    rt_bool_t need_wakeup = RT_FALSE;
 
     RT_ASSERT(work != RT_NULL);
     RT_ASSERT(queue != RT_NULL);
-    err = _workqueue_cancel_core(queue, work, RT_FALSE, &need_wakeup, RT_NULL);
-    if (err == RT_EOK && need_wakeup)
-    {
-        rt_completion_done(&(queue->wakeup_completion));
-    }
+    err = _workqueue_cancel_core(queue, work, RT_FALSE, RT_NULL);
 
     return err;
 }
@@ -837,7 +846,6 @@ rt_uint16_t rt_workqueue_get_work_status(struct rt_workqueue *queue, struct rt_w
 rt_err_t rt_workqueue_cancel_work_sync(struct rt_workqueue *queue, struct rt_work *work)
 {
     rt_bool_t need_wait = RT_FALSE;
-    rt_bool_t need_wakeup = RT_FALSE;
     rt_err_t err;
 
     RT_ASSERT(queue != RT_NULL);
@@ -847,16 +855,12 @@ rt_err_t rt_workqueue_cancel_work_sync(struct rt_workqueue *queue, struct rt_wor
         return -RT_EBUSY;
     }
 
-    err = _workqueue_cancel_core(queue, work, RT_TRUE, &need_wakeup, &need_wait);
+    err = _workqueue_cancel_core(queue, work, RT_TRUE, &need_wait);
     if (err != RT_EOK)
     {
         return err;
     }
 
-    if (need_wakeup)
-    {
-        rt_completion_done(&(queue->wakeup_completion));
-    }
     if (!need_wait)
     {
         return RT_EOK;
@@ -875,7 +879,8 @@ rt_err_t rt_workqueue_cancel_work_sync(struct rt_workqueue *queue, struct rt_wor
  *
  * @return RT_EOK on success.
  *
- * @note This API does not stop the running work.
+ * @note This API does not stop the running work. Queued works are unbound and
+ *       marked canceled while the queue lock is held.
  */
 rt_err_t rt_workqueue_cancel_all_work(struct rt_workqueue *queue)
 {
@@ -892,14 +897,17 @@ rt_err_t rt_workqueue_cancel_all_work(struct rt_workqueue *queue)
     need_wakeup = _workqueue_is_idle_nolock(queue) &&
                   rt_list_isempty(&(queue->delayed_list)) == RT_FALSE;
     _workqueue_detach_queued_nolock(queue, &pending_list, &delayed_list);
-    rt_spin_unlock_irqrestore(&(queue->spinlock), level);
-
-    _workqueue_cancel_detached_list(&pending_list);
-    _workqueue_cancel_detached_list(&delayed_list);
+    /* Unbind and mark canceled before the lock is dropped. A concurrent submit
+     * of the same work can therefore only happen before or after this call,
+     * never while the node sits on a detached list. */
+    _workqueue_cancel_detached_list_nolock(&pending_list);
+    _workqueue_cancel_detached_list_nolock(&delayed_list);
     if (need_wakeup)
     {
+        /* Keep the notification under the queue lock; see destroy. */
         rt_completion_done(&(queue->wakeup_completion));
     }
+    rt_spin_unlock_irqrestore(&(queue->spinlock), level);
 
     return RT_EOK;
 }

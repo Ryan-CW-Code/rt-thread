@@ -71,7 +71,8 @@ struct rt_workqueue
     rt_thread_t work_thread;              /* Worker thread owned by this queue */
     struct rt_spinlock spinlock;          /* Protects lists, work_current and flags */
     struct rt_completion wakeup_completion; /* Wakes worker for new work or delayed-head changes */
-    struct rt_completion sync_completion; /* Wakes cancel_work_sync/destroy_sync waiter */
+    struct rt_completion sync_completion; /* Wakes a cancel_work_sync waiter */
+    struct rt_completion exit_completion; /* Wakes a destroy_sync waiter after worker exit */
     rt_uint8_t flags;                     /* Internal RT_WORKQUEUE_FLAG_* bits */
 };
 
